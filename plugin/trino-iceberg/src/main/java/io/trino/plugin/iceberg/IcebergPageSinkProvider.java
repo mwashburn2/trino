@@ -16,6 +16,7 @@ package io.trino.plugin.iceberg;
 import com.google.inject.Inject;
 import io.airlift.json.JsonCodec;
 import io.airlift.units.DataSize;
+import io.trino.filesystem.Location;
 import io.trino.plugin.hive.SortingFileWriterConfig;
 import io.trino.plugin.iceberg.procedure.IcebergOptimizeHandle;
 import io.trino.plugin.iceberg.procedure.IcebergTableExecuteHandle;
@@ -32,6 +33,7 @@ import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTableExecuteHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.type.TypeManager;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionSpec;
@@ -46,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.Maps.transformValues;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.maxPartitionsPerWriter;
 import static io.trino.plugin.iceberg.IcebergUtil.getFileIoProperties;
@@ -61,7 +64,8 @@ public class IcebergPageSinkProvider
     private final PageIndexerFactory pageIndexerFactory;
     private final DataSize sortingFileWriterBufferSize;
     private final int sortingFileWriterMaxOpenFiles;
-    private final Optional<String> sortingFileWriterLocalStagingPath;
+    private final Optional<String> sortedWritingLocalStagingPath;
+    private final Optional<String> sortedWritingStagingLocation;
     private final TypeManager typeManager;
     private final PageSorter pageSorter;
 
@@ -82,7 +86,11 @@ public class IcebergPageSinkProvider
         this.pageIndexerFactory = requireNonNull(pageIndexerFactory, "pageIndexerFactory is null");
         this.sortingFileWriterBufferSize = sortingFileWriterConfig.getWriterSortBufferSize();
         this.sortingFileWriterMaxOpenFiles = sortingFileWriterConfig.getMaxOpenSortFiles();
-        this.sortingFileWriterLocalStagingPath = icebergConfig.getSortedWritingLocalStagingPath();
+        this.sortedWritingLocalStagingPath = icebergConfig.getSortedWritingLocalStagingPath();
+        this.sortedWritingStagingLocation = icebergConfig.getSortedWritingStagingLocation();
+        checkArgument(
+                sortedWritingLocalStagingPath.isEmpty() || sortedWritingStagingLocation.isEmpty(),
+                "iceberg.sorted-writing.local-staging-path and iceberg.sorted-writing.staging-location cannot both be set");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
         this.pageSorter = requireNonNull(pageSorter, "pageSorter is null");
     }
@@ -129,7 +137,7 @@ public class IcebergPageSinkProvider
                 tableHandle.sortOrderId(),
                 sortingFileWriterBufferSize,
                 sortingFileWriterMaxOpenFiles,
-                sortingFileWriterLocalStagingPath,
+                sortedWritingStagingDirectory(session, tableHandle.name()),
                 typeManager,
                 pageSorter);
     }
@@ -164,7 +172,7 @@ public class IcebergPageSinkProvider
                         optimizeHandle.sortOrderId(),
                         sortingFileWriterBufferSize,
                         sortingFileWriterMaxOpenFiles,
-                        sortingFileWriterLocalStagingPath,
+                        sortedWritingStagingDirectory(session, executeHandle.schemaTableName()),
                         typeManager,
                         pageSorter);
             }
@@ -173,6 +181,31 @@ public class IcebergPageSinkProvider
                 throw new IllegalArgumentException("Unknown procedure: " + executeHandle.procedureId());
             }
         };
+    }
+
+    private Optional<Location> sortedWritingStagingDirectory(ConnectorSession session, SchemaTableName tableName)
+    {
+        String user = session.getIdentity().getUser();
+        Optional<Location> localStagingDirectory = sortedWritingLocalStagingPath
+                .map(path -> path.replace("${USER}", user))
+                .map(IcebergPageSinkProvider::createLocalSchemeIfAbsent);
+        if (localStagingDirectory.isPresent()) {
+            return localStagingDirectory;
+        }
+        return sortedWritingStagingLocation
+                .map(path -> Location.of(path.replace("${USER}", user))
+                        .appendPath(tableName.getSchemaName())
+                        .appendPath(tableName.getTableName())
+                        .appendPath(session.getQueryId()));
+    }
+
+    private static Location createLocalSchemeIfAbsent(String path)
+    {
+        Location location = Location.of(path);
+        if (location.scheme().isPresent()) {
+            return location;
+        }
+        return Location.of("local:///" + location.path());
     }
 
     @Override
